@@ -2,15 +2,28 @@ import { join, normalize, sep } from 'path'
 import { getProjectRoot } from '../../bootstrap/state.js'
 import {
   buildMemoryPrompt,
+  ENTRYPOINT_NAME,
   ensureMemoryDirExists,
+  truncateEntrypointContent,
 } from '../../memdir/memdir.js'
 import { getMemoryBaseDir } from '../../memdir/paths.js'
+import { getFsImplementation } from '../../utils/fsOperations.js'
 import { getCwd } from '../../utils/cwd.js'
 import { findCanonicalGitRoot } from '../../utils/git.js'
 import { sanitizePath } from '../../utils/path.js'
 
-// Persistent agent memory scope: 'user' (~/.claude/agent-memory/), 'project' (.claude/agent-memory/), or 'local' (.claude/agent-memory-local/)
-export type AgentMemoryScope = 'user' | 'project' | 'local'
+// Persistent agent memory scope: 'user' (~/.claude/agent-memory/), 'project' (.claude/agent-memory/), 'local' (.claude/agent-memory-local/), or 'shared' (.claude/agent-memory-shared/)
+export type AgentMemoryScope = 'user' | 'project' | 'local' | 'shared'
+
+/**
+ * Returns the project-wide shared agent memory directory.
+ * All memory-enabled agents can read from and write to this pool,
+ * allowing knowledge to compound across agent boundaries.
+ * Path: <cwd>/.claude/agent-memory-shared/
+ */
+export function getProjectSharedMemoryDir(): string {
+  return join(getCwd(), '.claude', 'agent-memory-shared') + sep
+}
 
 /**
  * Sanitize an agent type name for use as a directory name.
@@ -48,6 +61,7 @@ function getLocalAgentMemoryDir(dirName: string): string {
  * - 'user' scope: <memoryBase>/agent-memory/<agentType>/
  * - 'project' scope: <cwd>/.claude/agent-memory/<agentType>/
  * - 'local' scope: see getLocalAgentMemoryDir()
+ * - 'shared' scope: <cwd>/.claude/agent-memory-shared/<agentType>/ (readable by all agents)
  */
 export function getAgentMemoryDir(
   agentType: string,
@@ -61,6 +75,8 @@ export function getAgentMemoryDir(
       return getLocalAgentMemoryDir(dirName)
     case 'user':
       return join(getMemoryBaseDir(), 'agent-memory', dirName) + sep
+    case 'shared':
+      return join(getCwd(), '.claude', 'agent-memory-shared', dirName) + sep
   }
 }
 
@@ -78,6 +94,15 @@ export function isAgentMemoryPath(absolutePath: string): boolean {
   // Project scope: always cwd-based (not redirected)
   if (
     normalizedPath.startsWith(join(getCwd(), '.claude', 'agent-memory') + sep)
+  ) {
+    return true
+  }
+
+  // Shared scope: project-wide pool accessible to all memory-enabled agents
+  if (
+    normalizedPath.startsWith(
+      join(getCwd(), '.claude', 'agent-memory-shared') + sep,
+    )
   ) {
     return true
   }
@@ -123,6 +148,8 @@ export function getMemoryScopeDisplay(
       return 'Project (.claude/agent-memory/)'
     case 'local':
       return `Local (${getLocalAgentMemoryDir('...')})`
+    case 'shared':
+      return 'Shared (.claude/agent-memory-shared/) — readable by all agents'
     default:
       return 'None'
   }
@@ -131,9 +158,12 @@ export function getMemoryScopeDisplay(
 /**
  * Load persistent memory for an agent with memory enabled.
  * Creates the memory directory if needed and returns a prompt with memory contents.
+ * For all scopes, also injects the project-wide shared memory pool (if populated)
+ * so knowledge learned by one agent can benefit all agents.
  *
  * @param agentType The agent's type name (used as directory name)
- * @param scope 'user' for ~/.claude/agent-memory/ or 'project' for .claude/agent-memory/
+ * @param scope 'user' for ~/.claude/agent-memory/, 'project' for .claude/agent-memory/,
+ *              'local' for .claude/agent-memory-local/, or 'shared' for .claude/agent-memory-shared/
  */
 export function loadAgentMemoryPrompt(
   agentType: string,
@@ -153,6 +183,10 @@ export function loadAgentMemoryPrompt(
       scopeNote =
         '- Since this memory is local-scope (not checked into version control), tailor your memories to this project and machine'
       break
+    case 'shared':
+      scopeNote =
+        '- Since this memory is shared-scope, it is readable by ALL agents in this project — save learnings that are broadly applicable across agent types. Memories here amplify every agent in the project.'
+      break
   }
 
   const memoryDir = getAgentMemoryDir(agentType, scope)
@@ -166,7 +200,7 @@ export function loadAgentMemoryPrompt(
 
   const coworkExtraGuidelines =
     process.env.CLAUDE_COWORK_MEMORY_EXTRA_GUIDELINES
-  return buildMemoryPrompt({
+  const agentMemoryPrompt = buildMemoryPrompt({
     displayName: 'Persistent Agent Memory',
     memoryDir,
     extraGuidelines:
@@ -174,4 +208,82 @@ export function loadAgentMemoryPrompt(
         ? [scopeNote, coworkExtraGuidelines]
         : [scopeNote],
   })
+
+  // For non-shared scopes, also inject the project-wide shared pool so that
+  // knowledge saved by any shared-scope agent is available to all agents.
+  // This is the cross-agent amplification layer.
+  if (scope !== 'shared') {
+    const sharedPoolPrompt = loadSharedPoolPrompt(agentType)
+    if (sharedPoolPrompt) {
+      return agentMemoryPrompt + '\n\n' + sharedPoolPrompt
+    }
+  }
+
+  return agentMemoryPrompt
+}
+
+/**
+ * Load the project-wide shared memory pool for cross-agent knowledge injection.
+ * Scans .claude/agent-memory-shared/ for any agent subdirectories and builds
+ * a compact summary. Returns null if the shared pool is empty or missing.
+ *
+ * This is what allows knowledge from one agent to amplify all other agents:
+ * any agent with memory enabled automatically receives shared-scope memories
+ * written by any other agent in the project.
+ *
+ * @param excludeAgentType - The calling agent's own type. Its shared-scope
+ *   directory (if any) is excluded to avoid loading memories twice — the
+ *   agent's own shared directory is already included via buildMemoryPrompt().
+ */
+export function loadSharedPoolPrompt(excludeAgentType?: string): string | null {
+  const sharedBase = getProjectSharedMemoryDir()
+  const fs = getFsImplementation()
+
+  let agentDirs: string[]
+  try {
+    const excludeName = excludeAgentType
+      ? sanitizeAgentTypeForPath(excludeAgentType)
+      : undefined
+    // eslint-disable-next-line custom-rules/no-sync-fs
+    const dirents = fs.readdirSync(sharedBase)
+    agentDirs = dirents
+      .filter(d => d.isDirectory() && d.name !== excludeName)
+      .map(d => d.name)
+  } catch {
+    // Shared pool directory does not exist yet — nothing to inject
+    return null
+  }
+
+  if (agentDirs.length === 0) {
+    return null
+  }
+
+  const sections: string[] = []
+  for (const dir of agentDirs) {
+    const entrypoint = join(sharedBase, dir, ENTRYPOINT_NAME)
+    let content = ''
+    try {
+      // eslint-disable-next-line custom-rules/no-sync-fs
+      content = fs.readFileSync(entrypoint, { encoding: 'utf-8' })
+    } catch {
+      continue
+    }
+    if (!content.trim()) continue
+    const t = truncateEntrypointContent(content)
+    sections.push(`### From agent: ${dir}\n\n${t.content}`)
+  }
+
+  if (sections.length === 0) {
+    return null
+  }
+
+  return [
+    '# Cross-Agent Shared Knowledge',
+    '',
+    `The following memories were saved by other agents in this project to the shared pool at \`${sharedBase}\`. Use them as additional context — they represent learnings that benefit all agents.`,
+    '',
+    '**To contribute to this shared pool:** any agent whose agent definition file specifies `memory: shared` saves its memories here instead of a private directory. Those memories then automatically appear in the context of every other memory-enabled agent in this project.',
+    '',
+    ...sections,
+  ].join('\n')
 }
