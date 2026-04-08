@@ -89,7 +89,7 @@ const AgentJsonSchema = lazySchema(() =>
     maxTurns: z.number().int().positive().optional(),
     skills: z.array(z.string()).optional(),
     initialPrompt: z.string().optional(),
-    memory: z.enum(['user', 'project', 'local']).optional(),
+    memory: z.enum(['user', 'project', 'local', 'shared']).optional(),
     background: z.boolean().optional(),
     isolation: (process.env.USER_TYPE === 'ant'
       ? z.enum(['worktree', 'remote'])
@@ -591,7 +591,7 @@ export function parseAgentFromMarkdown(
       backgroundRaw === 'true' || backgroundRaw === true ? true : undefined
 
     // Parse memory scope
-    const VALID_MEMORY_SCOPES: AgentMemoryScope[] = ['user', 'project', 'local']
+    const VALID_MEMORY_SCOPES: AgentMemoryScope[] = ['user', 'project', 'local', 'shared']
     const memoryRaw = frontmatter['memory'] as string | undefined
     let memory: AgentMemoryScope | undefined
     if (memoryRaw !== undefined) {

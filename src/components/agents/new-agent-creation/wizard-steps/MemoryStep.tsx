@@ -48,6 +48,9 @@ export function MemoryStep() {
     }, {
       label: "Local scope (.claude/agent-memory-local/)",
       value: "local"
+    }, {
+      label: "Shared scope (.claude/agent-memory-shared/) — knowledge visible to all agents",
+      value: "shared"
     }] : [{
       label: "Project scope (.claude/agent-memory/) (Recommended)",
       value: "project"
@@ -60,6 +63,9 @@ export function MemoryStep() {
     }, {
       label: "Local scope (.claude/agent-memory-local/)",
       value: "local"
+    }, {
+      label: "Shared scope (.claude/agent-memory-shared/) — knowledge visible to all agents",
+      value: "shared"
     }];
     $[1] = isUserScope;
     $[2] = t1;

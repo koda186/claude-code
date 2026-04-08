@@ -32,7 +32,7 @@ import {
 import type { PluginManifest } from './schemas.js'
 import { walkPluginMarkdown } from './walkPluginMarkdown.js'
 
-const VALID_MEMORY_SCOPES: AgentMemoryScope[] = ['user', 'project', 'local']
+const VALID_MEMORY_SCOPES: AgentMemoryScope[] = ['user', 'project', 'local', 'shared']
 
 async function loadAgentsFromDirectory(
   agentsPath: string,
